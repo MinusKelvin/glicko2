@@ -47,6 +47,166 @@ pub struct GameResult {
     score: f64,
 }
 
+/// Represents the results of a player versus their opponents during the current rating period.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AccumulatedResults {
+    /// Indicates whether any games were played in the current rating period
+    pub any_games_recorded: bool,
+    /// Accumulation of the summation in the computation for quantity v
+    pub v_sum: f64,
+    /// Accumulation of the summation in the computation for quantity delta
+    pub delta_sum: f64,
+}
+
+impl AccumulatedResults {
+    fn fold_v(&mut self, our_rating: Glicko2Rating, opponent_glicko2: Glicko2Rating) {
+        self.v_sum += {
+            g(opponent_glicko2.deviation) * g(opponent_glicko2.deviation)
+                * e(
+                    our_rating.value,
+                    opponent_glicko2.value,
+                    opponent_glicko2.deviation,
+                )
+                * (1.0
+                    - e(
+                        our_rating.value,
+                        opponent_glicko2.value,
+                        opponent_glicko2.deviation,
+                    ))
+        };
+    }
+
+    fn fold_delta(&mut self, our_rating: Glicko2Rating, opponent_glicko2: Glicko2Rating, score: f64) {
+        self.delta_sum += {
+            g(opponent_glicko2.deviation)
+                * (score
+                    - e(
+                        our_rating.value,
+                        opponent_glicko2.value,
+                        opponent_glicko2.deviation,
+                    ))
+        };
+    }
+
+    /// Record a win against an opponent.
+    pub fn win(&mut self, our_rating: Glicko2Rating, opponent_rating: impl Into<Glicko2Rating>) {
+        let opponent_glicko2: Glicko2Rating = opponent_rating.into();
+        self.fold_v(our_rating, opponent_glicko2);
+        self.fold_delta(our_rating, opponent_glicko2, 1.0);
+        self.any_games_recorded = true;
+    }
+
+    /// Record a loss against an opponent
+    pub fn loss(&mut self, our_rating: Glicko2Rating, opponent_rating: impl Into<Glicko2Rating>) {
+        let opponent_glicko2: Glicko2Rating = opponent_rating.into();
+        self.fold_v(our_rating, opponent_glicko2);
+        self.fold_delta(our_rating, opponent_glicko2, 0.0);
+        self.any_games_recorded = true;
+    }
+
+    /// Record a draw against an opponent
+    pub fn draw(&mut self, our_rating: Glicko2Rating, opponent_rating: impl Into<Glicko2Rating>) {
+        let opponent_glicko2: Glicko2Rating = opponent_rating.into();
+        self.fold_v(our_rating, opponent_glicko2);
+        self.fold_delta(our_rating, opponent_glicko2, 0.5);
+        self.any_games_recorded = true;
+    }
+
+    /// Calculates the rating of the player at the end of the rating period.
+    pub fn new_rating(&self, our_rating: Glicko2Rating, sys_constant: f64) -> Glicko2Rating {
+        if self.any_games_recorded {
+            let v = self.v_sum.recip();
+            let delta = v * self.delta_sum;
+            let new_volatility = {
+                let mut a = (our_rating.volatility * our_rating.volatility).ln();
+                let delta_squared = delta * delta;
+                let rd_squared = our_rating.deviation * our_rating.deviation;
+                let mut b = if delta_squared > rd_squared + v {
+                    delta_squared - rd_squared - v
+                } else {
+                    let mut k = 1.0;
+                    while f(
+                        a - k * sys_constant,
+                        delta,
+                        our_rating.deviation,
+                        v,
+                        our_rating.volatility,
+                        sys_constant,
+                    ) < 0.0
+                    {
+                        k += 1.0;
+                    }
+                    a - k * sys_constant
+                };
+                let mut fa = f(
+                    a,
+                    delta,
+                    our_rating.deviation,
+                    v,
+                    our_rating.volatility,
+                    sys_constant,
+                );
+                let mut fb = f(
+                    b,
+                    delta,
+                    our_rating.deviation,
+                    v,
+                    our_rating.volatility,
+                    sys_constant,
+                );
+                while (b - a).abs() > CONVERGENCE_TOLERANCE {
+                    // a
+                    let c = a + ((a - b) * fa / (fb - fa));
+                    let fc = f(
+                        c,
+                        delta,
+                        our_rating.deviation,
+                        v,
+                        our_rating.volatility,
+                        sys_constant,
+                    );
+                    // b
+                    if fc * fb < 0.0 {
+                        a = b;
+                        fa = fb;
+                    } else {
+                        fa /= 2.0;
+                    }
+                    // c
+                    b = c;
+                    fb = fc;
+                    // d (while loop)
+                }
+                (a / 2.0).exp()
+            };
+            let new_pre_rd = ((our_rating.deviation * our_rating.deviation)
+                + (new_volatility * new_volatility))
+                .sqrt();
+            let new_rd = {
+                let subexpr_1 = (new_pre_rd * new_pre_rd).recip();
+                let subexpr_2 = v.recip();
+                (subexpr_1 + subexpr_2).sqrt().recip()
+            };
+            // yeah that sum that was here is the same one used in the computation of delta.
+            let new_rating = our_rating.value + ((new_rd * new_rd) * self.delta_sum);
+            Glicko2Rating {
+                value: new_rating,
+                deviation: new_rd,
+                volatility: new_volatility,
+            }
+        } else {
+            let new_rd = ((our_rating.deviation * our_rating.deviation)
+                + (our_rating.volatility * our_rating.volatility))
+                .sqrt();
+            Glicko2Rating {
+                value: our_rating.value,
+                deviation: new_rd,
+                volatility: our_rating.volatility,
+            }
+        }
+    }
+}
+
 impl GameResult {
     /// Constructs a new game result representing a win over a player or team
     /// with rating `opponent_rating`.
@@ -360,6 +520,32 @@ mod tests {
         }));
 
         let new_rating = new_rating(example_player_rating, &results, 0.5);
+        assert!(Relative::default().epsilon(0.0001).eq(&new_rating.value, &-0.2069));
+        assert!(Relative::default().epsilon(0.0001).eq(&new_rating.deviation, &0.8722));
+        assert!(Relative::default().epsilon(0.0001).eq(&new_rating.volatility, &0.05999))
+    }
+
+    #[test]
+    fn test_rating_update_accumulated() {
+        let example_player_rating = Glicko2Rating::from(GlickoRating {
+            value: 1500.0,
+            deviation: 200.0,
+        });
+        let mut results = AccumulatedResults::default();
+        results.win(example_player_rating, GlickoRating {
+            value: 1400.0,
+            deviation: 30.0,
+        });
+        results.loss(example_player_rating, GlickoRating {
+            value: 1550.0,
+            deviation: 100.0,
+        });
+        results.loss(example_player_rating, GlickoRating {
+            value: 1700.0,
+            deviation: 300.0,
+        });
+
+        let new_rating = results.new_rating(example_player_rating, 0.5);
         assert!(Relative::default().epsilon(0.0001).eq(&new_rating.value, &-0.2069));
         assert!(Relative::default().epsilon(0.0001).eq(&new_rating.deviation, &0.8722));
         assert!(Relative::default().epsilon(0.0001).eq(&new_rating.volatility, &0.05999))
